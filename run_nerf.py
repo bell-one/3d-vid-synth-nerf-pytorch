@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from run_nerf_helpers import *
 
 from load_llff import load_llff_data
+from load_3dvideo import load_3dvideo_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
@@ -34,10 +35,12 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, viewdirs, time, fn, time_fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+
+    inputs_flat = time_fn(inputs_flat, time)
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
@@ -51,12 +54,12 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, time, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], time=time, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -66,7 +69,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
+def render(H, W, K, time, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
                   **kwargs):
@@ -123,7 +126,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, time, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -149,13 +152,15 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
+        frame = i / 120
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, _ = render(H, W, K, frame, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
             print(rgb.shape, disp.shape)
+
 
         """
         if gt_imgs is not None and render_factor==0:
@@ -164,6 +169,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         """
 
         if savedir is not None:
+            print('save')
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
@@ -186,6 +192,9 @@ def create_nerf(args):
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
+
+    timeFunction = Time()
+
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
@@ -198,7 +207,7 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
-    network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
+    network_query_fn = lambda inputs, viewdirs, time, network_fn, time_fn : run_network(inputs, viewdirs, time, network_fn, time_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
@@ -244,6 +253,7 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'time_fn' : timeFunction
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -306,6 +316,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
 
 def render_rays(ray_batch,
+                time,
                 network_fn,
                 network_query_fn,
                 N_samples,
@@ -316,6 +327,7 @@ def render_rays(ray_batch,
                 network_fine=None,
                 white_bkgd=False,
                 raw_noise_std=0.,
+                time_fn=None,
                 verbose=False,
                 pytest=False):
     """Volumetric rendering.
@@ -354,7 +366,7 @@ def render_rays(ray_batch,
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples).to(device)
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
@@ -382,7 +394,7 @@ def render_rays(ray_batch,
 
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_query_fn(pts, viewdirs, time, network_fn, time_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
@@ -398,7 +410,7 @@ def render_rays(ray_batch,
 
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
-        raw = network_query_fn(pts, viewdirs, run_fn)
+        raw = network_query_fn(pts, viewdirs, time, run_fn, time_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -565,6 +577,34 @@ def train():
             near = 0.
             far = 1.
         print('NEAR FAR', near, far)
+    elif args.dataset_type == '3dvideo':
+        images, poses, bds, render_poses, i_test = load_3dvideo_data(args.datadir, args.factor,
+                                                                  recenter=True, bd_factor=.75,
+                                                                  spherify=args.spherify)
+        hwf = poses[0,:3,-1]
+        poses = poses[:,:3,:4]
+        #print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
+        if not isinstance(i_test, list):
+            i_test = [i_test]
+
+        # if args.llffhold > 0:
+        #     print('Auto LLFF holdout,', args.llffhold)
+        #     i_test = np.arange(images.shape[0])[::args.llffhold]
+
+        i_val = i_test
+        i_train = np.array([i for i in np.arange(int(images.shape[1])) if
+                        (i not in i_test and i not in i_val)])
+        i_train_time = np.array([i for i in np.arange(int(images.shape[0]))])
+
+        print('DEFINING BOUNDS')
+        if args.no_ndc:
+            near = np.ndarray.min(bds) * .9
+            far = np.ndarray.max(bds) * 1.
+
+        else:
+            near = 0.
+            far = 1.
+        print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
@@ -674,6 +714,7 @@ def train():
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
+    use_batching = False
     if use_batching:
         # For random ray batching
         print('get rays')
@@ -698,15 +739,19 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = 2000000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
+    print('TRAIN times are', i_train_time)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    from torch.utils.tensorboard import SummaryWriter
+
+    logsavedir = os.path.join(basedir, expname)
+    writer = SummaryWriter(logsavedir)
+
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -728,12 +773,15 @@ def train():
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
-            target = images[img_i]
+            time_i = np.random.choice(i_train_time)
+            target = images[time_i][img_i]
+            t = time_i / int(images.shape[0])
+            #t = torch.Tensor(t).to(device)
             target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose).to(device))  # (H, W, 3), (H, W, 3)
 
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
@@ -757,7 +805,7 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+        rgb, disp, acc, extras = render(H, W, K, time = t,chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
@@ -799,10 +847,10 @@ def train():
             }, path)
             print('Saved checkpoints at', path)
 
-        if i%args.i_video==0 and i > 0:
+        if i%args.i_video==0 and i > 500000:
             # Turn on testing mode
             with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                rgbs, disps = render_path(render_poses, hwf, K, (int)(args.chunk * 0.5), render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
@@ -815,18 +863,20 @@ def train():
             #     render_kwargs_test['c2w_staticcam'] = None
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
-        if i%args.i_testset==0 and i > 0:
+        if i%args.i_testset==0 and i >= 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, (int)(args.chunk * 0.5), render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
 
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            writer.add_scalar('Train/loss', loss, i)
+            writer.add_scalar('Train/psnr', psnr, i)
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
@@ -868,6 +918,29 @@ def train():
                         tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
                         tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
+
+        if i % args.i_img == 0:
+            # Log a rendered validation view to Tensorboard
+            print('log validation')
+            img_i = np.random.choice(i_train)
+            time_i = np.random.choice(i_train_time)
+            target = images[time_i][img_i]
+            target = torch.Tensor(target).to(device)
+            t = time_i / int(images.shape[0])
+            pose = poses[img_i, :3, :4]
+            with torch.no_grad():
+                rgb, disp, acc, extras = render(H, W, K, t, chunk=(int)(args.chunk * 0.5), c2w=pose,
+                                                **render_kwargs_train)
+            loss = img2mse(rgb, target)
+            psnr = mse2psnr(loss)
+
+            rgb = torch.from_numpy(np.transpose(to8b(rgb.cpu().numpy()), (2, 0, 1)))
+
+            writer.add_image('Image/val_rgb', torch.transpose(torch.transpose(target, 2, 0), 1, 2), i)
+            writer.add_image('Image/synthetic_rgb', rgb, i)
+            writer.add_scalar('Val/val_loss', loss, i)
+            writer.add_scalar('Val/val_psnr', psnr, i)
+            print('log validation end')
 
         global_step += 1
 

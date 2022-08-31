@@ -1,9 +1,9 @@
-expname = fern_test
+expname = martini_test
 basedir = ./logs
-datadir = ../../../Data/NeRF/nerf_llff_data/fern
-dataset_type = llff
+datadir = ./data/coffee_martini
+dataset_type = 3dvideo
 
-factor = 8
+factor = 4
 llffhold = 8
 
 N_rand = 1024
