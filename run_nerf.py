@@ -659,8 +659,8 @@ def train():
             [0, 0, 1]
         ])
 
-    if args.render_test:
-        render_poses = np.array(poses[i_test])
+    # if args.render_test:
+    #     render_poses = np.array(poses[i_test])
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -847,7 +847,7 @@ def train():
             }, path)
             print('Saved checkpoints at', path)
 
-        if i%args.i_video==0 and i > 500000:
+        if i % args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, (int)(args.chunk * 0.5), render_kwargs_test)
@@ -921,7 +921,7 @@ def train():
 
         if i % args.i_img == 0:
             # Log a rendered validation view to Tensorboard
-            print('log validation')
+            #print('valid for visulization')
             img_i = np.random.choice(i_train)
             time_i = np.random.choice(i_train_time)
             target = images[time_i][img_i]
@@ -940,7 +940,6 @@ def train():
             writer.add_image('Image/synthetic_rgb', rgb, i)
             writer.add_scalar('Val/val_loss', loss, i)
             writer.add_scalar('Val/val_psnr', psnr, i)
-            print('log validation end')
 
         global_step += 1
 

@@ -65,7 +65,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     sfx = ''
     whole_files=[]
 
-    cam_count = 3
+    cam_count = 21
     frame_count = 300
 
 
@@ -108,7 +108,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
             return imageio.imread(f)
     whole_imgs = []
     for i in range(0, frame_count):
-        imgs = [imread(whole_files[j][i])[..., :3] / 255. for j in range(cam_count)]
+        imgs = [imread(whole_files[j][i])[..., :3] / 255. for j in range(len(whole_files))]
         imgs = np.stack(imgs, -1)
         whole_imgs.append(imgs)
 
